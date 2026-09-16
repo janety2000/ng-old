@@ -2,10 +2,12 @@ name: MyJobMag Scraper
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # every 6 hours (00:00, 06:00, 12:00, 18:00 UTC)
+    - cron: "*/30 * * * *"   # every 30 minutes — each run only does a small
+                              # page chunk now, so it needs to run more often
+                              # to work through the backlog in reasonable time
   workflow_dispatch: {}       # allows manual "Run workflow" trigger too
 
-# Needed so the job can commit processed.csv back to the repo
+# Needed so the job can commit processed.csv / current_page.txt back to the repo
 permissions:
   contents: write
 
@@ -16,7 +18,10 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 25       # a chunked run (PAGES_PER_RUN pages) should
+                               # comfortably finish well inside this; raise
+                               # PAGES_PER_RUN and this together if you want
+                               # bigger chunks per run
 
     steps:
       - name: Checkout repo
@@ -37,18 +42,20 @@ jobs:
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USERNAME: ${{ secrets.WP_USERNAME }}
           WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+          PAGES_PER_RUN: "15"   # pages walked per invocation; tune to taste
         run: python myjobmag_scraper.py
 
-      # Persist processed.csv so the NEXT scheduled run knows what's already
-      # been posted and picks up where this run left off — no duplicates.
-      - name: Commit processed.csv
+      # Persist processed.csv AND current_page.txt so the NEXT scheduled run
+      # knows what's already been posted, and which page to resume from —
+      # no duplicates, and no starting over from page 10800 every time.
+      - name: Commit progress files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add processed.csv
+          git add processed.csv current_page.txt
           if git diff --cached --quiet; then
-            echo "No changes to processed.csv — nothing to commit."
+            echo "No changes to commit."
           else
-            git commit -m "chore: update processed.csv [skip ci]"
+            git commit -m "chore: update scraper progress [skip ci]"
             git push
           fi
