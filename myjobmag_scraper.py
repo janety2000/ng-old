@@ -24,6 +24,16 @@ END_PAGE     = 50         # and goes down to (and including) here, eventually
 # scheduled run picks up right after that — see load_current_page/save_current_page.
 PAGES_PER_RUN = int(os.environ.get("PAGES_PER_RUN", "15"))
 
+# Wall-clock safety valve. PAGES_PER_RUN caps things in the *normal* case,
+# but a slow page (big company logo, slow response, many subjobs) can still
+# make one run overrun. Rather than let GitHub's timeout-minutes cancel the
+# process (which risks the commit step being skipped, and does not save
+# progress from a page that was only half-processed when killed), the
+# script itself checks elapsed time and stops cleanly — finishing the
+# current page, saving state, and exiting normally — well before the
+# workflow's outer timeout. Keep this comfortably below timeout-minutes.
+MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "18") ) * 60
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -630,8 +640,17 @@ def run():
 
     posted = skipped = failed = 0
     last_page_done = start_page
+    run_started = time.monotonic()
+    stopped_early = False
 
     for page_num in page_range:
+        if time.monotonic() - run_started > MAX_RUN_SECONDS:
+            logger.info(f"⏱ Time budget ({MAX_RUN_SECONDS}s) reached — "
+                        f"stopping cleanly before page {page_num} instead of "
+                        f"risking a hard timeout cancellation.")
+            stopped_early = True
+            break
+
         last_page_done = page_num
         job_urls = scrape_job_list_page(page_num)
 
@@ -703,7 +722,8 @@ def run():
         save_current_page(page_num - 1)
 
     logger.info(f"\n{'#'*60}")
-    logger.info(f" RUN COMPLETE ({datetime.now().strftime('%Y-%m-%d %H:%M')})")
+    logger.info(f" RUN COMPLETE ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
+                f"{' — stopped early on time budget' if stopped_early else ''}")
     logger.info(f" 📄 Pages this run : {start_page} → {last_page_done}")
     logger.info(f" ▶️  Resumes next at: {last_page_done - 1}")
     logger.info(f" ✅ Posted  : {posted}")
