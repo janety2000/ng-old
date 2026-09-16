@@ -14,8 +14,8 @@ from bs4 import BeautifulSoup
 # CONFIG
 # ════════════════════════════════════════════════════════════════════════════
 BASE_URL     = "https://www.myjobmag.com"
-START_PAGE   = 3      # scrape starts here
-END_PAGE     = 1      # and goes down to (and including) here
+START_PAGE   = 10800      # scrape starts here
+END_PAGE     = 50      # and goes down to (and including) here
 PAGE_RANGE   = range(START_PAGE, END_PAGE - 1, -1)   # 3, 2, 1
 
 HEADERS = {
