@@ -1,3 +1,26 @@
+#!/usr/bin/env python3
+"""
+myjobmag_scraper.py
+────────────────────────────────────────────────────────────────────────────
+Pure scraper — NO Mistral, NO sentence-transformers, NO language_tool.
+Scrapes myjobmag.com job listing pages 3 → 1 (descending), pulls full job +
+company details, and posts straight to WordPress (job-listings + companies
+custom post types) via the WP REST API.
+
+ENV VARS REQUIRED (set as GitHub Actions secrets or locally):
+    WP_BASE_URL      e.g. https://nigeria.mimusjobs.com/wp-json/wp/v2
+    WP_USERNAME
+    WP_APP_PASSWORD
+
+processed.csv is the dedup ledger — every job ID that has been scraped
+(posted, skipped, or failed) is written here. The GitHub Actions workflow
+commits this file back to the repo after every run, so the NEXT run reads
+it fresh and automatically skips everything already processed — it will
+never repost the same job twice, and effectively "resumes" from where the
+last run left off.
+────────────────────────────────────────────────────────────────────────────
+"""
+
 import os
 import re
 import csv
@@ -14,8 +37,8 @@ from bs4 import BeautifulSoup
 # CONFIG
 # ════════════════════════════════════════════════════════════════════════════
 BASE_URL     = "https://www.myjobmag.com"
-START_PAGE   = 10800      # scrape starts here
-END_PAGE     = 50      # and goes down to (and including) here
+START_PAGE   = 3      # scrape starts here
+END_PAGE     = 1      # and goes down to (and including) here
 PAGE_RANGE   = range(START_PAGE, END_PAGE - 1, -1)   # 3, 2, 1
 
 HEADERS = {
@@ -200,34 +223,136 @@ def scrape_company_details(company_url: str) -> dict:
     return company
 
 
-def scrape_job_details(job_url: str) -> dict:
-    soup = get_soup(job_url)
+def _extract_date_pair(soup) -> tuple:
+    """
+    Returns (posted_str, deadline_str) with the 'Posted:'/'Deadline:' <b> labels
+    stripped out first. Doing .get_text(strip=True) directly on the container
+    (as the old code did) concatenates "Posted:" + "May 15, 2013" into
+    "Posted:May 15, 2013" with no space, which fails every strptime() call —
+    this was why EVERY job, old and new, was being skipped. Removing the <b>
+    label before reading the text fixes it for both old and new page layouts,
+    since both use the same div.read-date-sec-li markup.
+    """
+    posted_str, deadline_str = "", ""
+    date_lis = soup.select("div.read-date-sec div.read-date-sec-li")
+    if len(date_lis) >= 1:
+        li = date_lis[0]
+        b = li.find("b")
+        if b:
+            b.extract()
+        posted_str = li.get_text(strip=True)
+    if len(date_lis) >= 2:
+        li = date_lis[1]
+        b = li.find("b")
+        if b:
+            b.extract()
+        deadline_str = li.get_text(strip=True)
+    return posted_str, deadline_str
 
-    job_title = text_of(soup, "h2.mag-b").replace("Method of Application", "").strip()
 
-    printable_items = soup.select("#printable > ul > li")
+def _extract_company_url(soup) -> str:
+    # New-style pages: "View Jobs at X" link next to the job title.
+    a = soup.select_one("li.job-industry a[href^='/jobs-at/']")
+    if a and a.get("href"):
+        href = a["href"]
+        return BASE_URL + href if href.startswith("/") else href
+    # Old-style pages: a bare anchor as a direct child of #printable.
+    for a in soup.select("#printable > a"):
+        href = a.get("href")
+        if href:
+            return BASE_URL + href if href.startswith("/") else href
+    return ""
 
-    def item_info(idx):
-        if idx < len(printable_items):
-            span = printable_items[idx].select_one("span.jkey-info")
-            return span.get_text(strip=True) if span else ""
+
+def _extract_application(soup) -> str:
+    """Email address if one is present in the Method of Application block,
+    otherwise the apply link's href (works for both old mailto-style blocks
+    and new /apply-now/ or external form links)."""
+    app_block = soup.select_one("#printable > div.mag-b.bm-b-30")
+    if not app_block:
+        h2 = soup.select_one("#application-method")
+        app_block = h2.find_next_sibling("div") if h2 else None
+
+    if not app_block:
         return ""
 
-    job_type          = item_info(0)
-    job_qualifications = item_info(1)
-    job_experience     = item_info(2)
-    job_location       = item_info(3)
-    job_field          = item_info(4)
+    text = app_block.get_text(" ", strip=True)
+    email_match = re.search(r"[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,4}", text)
+    if email_match:
+        return email_match.group(0)
 
-    job_salary = ""
-    for li in soup.select("#printable ul li"):
-        title_span = li.select_one("span.jkey-title")
-        if title_span and title_span.get_text(strip=True) == "Salary Range":
-            info_span = li.select_one("span.jkey-info")
-            job_salary = info_span.get_text(strip=True) if info_span else ""
-            break
+    link = app_block.select_one("a")
+    if link and link.get("href"):
+        href = link["href"]
+        return BASE_URL + href if href.startswith("/") else href
 
-    date_posted_str = text_of(soup, "#posted-date")
+    return ""
+
+
+def scrape_job_details(job_url: str) -> list:
+    """
+    Returns a LIST of job dicts. Most pages have exactly one job; older
+    /readjob/.../ pages bundle several positions under one shared company +
+    application block (e.g. "Accountant", "Customer Relations Officer",
+    "Marketers" all under one "Jobs in a Dry Cleaning..." page) — each of
+    those becomes its own job dict here, instead of only the first one
+    being captured.
+    """
+    soup = get_soup(job_url)
+
+    # Every job heading is a direct child <h2 class="mag-b" id="job...">
+    # of #printable, on both old multi-job pages and new single-job pages.
+    job_headings = soup.select("#printable > h2.mag-b")
+    if not job_headings:
+        h2 = soup.select_one("h2.mag-b")
+        if h2:
+            job_headings = [h2]
+
+    subjob_blocks = []
+    for h2 in job_headings:
+        link_el = h2.select_one("a")
+        if link_el and link_el.get("href"):
+            title = link_el.get_text(strip=True)
+            href = link_el["href"]
+            subjob_url = BASE_URL + href if href.startswith("/") else href
+        else:
+            span_el = h2.select_one("span.subjob-title")
+            title = span_el.get_text(strip=True) if span_el else h2.get_text(strip=True)
+            subjob_url = job_url
+        title = title.replace("Method of Application", "").strip()
+        if not title:
+            continue
+
+        key_info_ul = h2.find_next_sibling("ul", class_="job-key-info")
+        details_div = h2.find_next_sibling("div", class_="job-details")
+
+        def kv(label):
+            if not key_info_ul:
+                return ""
+            for li in key_info_ul.select("li"):
+                t = li.select_one("span.jkey-title")
+                if t and t.get_text(strip=True) == label:
+                    info = li.select_one("span.jkey-info")
+                    return info.get_text(strip=True) if info else ""
+            return ""
+
+        subjob_blocks.append({
+            "title": title,
+            "url": subjob_url,
+            "job_type": kv("Job Type"),
+            "qualifications": kv("Qualification"),
+            "experience": kv("Experience"),
+            "location": kv("Location"),
+            "field": kv("Job Field"),
+            "salary": kv("Salary Range"),
+            "description": details_div.get_text("\n", strip=True) if details_div else "",
+        })
+
+    if not subjob_blocks:
+        logger.warning(f"No job blocks found on page — skipping: {job_url}")
+        return []
+
+    date_posted_str, deadline_raw = _extract_date_pair(soup)
     date_posted = None
     for fmt in ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d", "%d %B %Y"):
         try:
@@ -236,67 +361,49 @@ def scrape_job_details(job_url: str) -> dict:
         except ValueError:
             continue
     if date_posted is None:
-        logger.warning(f"Invalid/unparseable date '{date_posted_str}' — skipping job: {job_url}")
-        return None
+        logger.warning(f"Invalid/unparseable date '{date_posted_str}' — skipping page: {job_url}")
+        return []
 
     estimated_deadline = add_three_months(date_posted)
-
-    deadline_raw = text_of(soup, "div.read-left-section > ul > li.read-head > div > div:nth-of-type(2)")
-    deadline = deadline_raw.replace("Deadline:", "").strip()
+    deadline = deadline_raw.strip()
     if not deadline or deadline.lower() == "not specified":
         deadline = estimated_deadline
 
-    job_description_main = text_of(soup, "div.job-details")
-    application_detail = text_of(soup, "#printable > div.mag-b.bm-b-30 > p")
-    job_description = job_description_main + (("\n\n" + application_detail) if application_detail else "")
-
-    application_block_text = ""
-    app_block = soup.select_one("#printable > div.mag-b.bm-b-30")
-    if app_block:
-        application_block_text = app_block.get_text(" ", strip=True)
-    email_match = re.search(r"[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,4}", application_block_text)
-    extracted_email = email_match.group(0) if email_match else ""
-
-    app_link_el = soup.select_one("#printable > div.mag-b.bm-b-30 > a")
-    app_link_text = app_link_el.get_text(strip=True) if app_link_el else ""
-    last_part = app_link_text.split("on")[-1].strip() if app_link_text else ""
-
-    company_urls = []
-    for a in soup.select("#printable > a"):
-        href = a.get("href")
-        if href:
-            company_urls.append(BASE_URL + href if href.startswith("/") else href)
-
-    company = scrape_company_details(company_urls[0] if company_urls else "")
+    application = _extract_application(soup)
+    company_url = _extract_company_url(soup)
+    company = scrape_company_details(company_url)
     if not company["details"] and company["name"]:
         company["details"] = search_company_details_fallback(company["name"])
+    if not application:
+        application = company["website"]
 
-    application = extracted_email or last_part or company["website"] or ""
-
-    return {
-        "job_title": sanitize(job_title),
-        "job_type": sanitize(job_type),
-        "job_qualifications": sanitize(job_qualifications),
-        "job_experience": sanitize(job_experience),
-        "job_location": sanitize(job_location),
-        "job_field": sanitize(job_field),
-        "date_posted": sanitize(date_posted_str),
-        "deadline": sanitize(deadline),
-        "job_description": sanitize(job_description),
-        "application": sanitize(application),
-        "company_url": sanitize(company_urls[0] if company_urls else ""),
-        "company_name": sanitize(company["name"]),
-        "company_logo": sanitize(company["logo"]),
-        "company_industry": sanitize(company["industry"]),
-        "company_founded": sanitize(company["founded"]),
-        "company_type": sanitize(company["type"]),
-        "company_website": sanitize(company["website"]),
-        "company_address": sanitize(company["address"]),
-        "company_details": sanitize(company["details"]),
-        "job_url": sanitize(job_url),
-        "estimated_deadline": sanitize(estimated_deadline),
-        "salary_range": sanitize(job_salary),
-    }
+    jobs = []
+    for blk in subjob_blocks:
+        jobs.append({
+            "job_title": sanitize(blk["title"]),
+            "job_type": sanitize(blk["job_type"]),
+            "job_qualifications": sanitize(blk["qualifications"]),
+            "job_experience": sanitize(blk["experience"]),
+            "job_location": sanitize(blk["location"]),
+            "job_field": sanitize(blk["field"]),
+            "date_posted": sanitize(date_posted_str),
+            "deadline": sanitize(deadline),
+            "job_description": sanitize(blk["description"]),
+            "application": sanitize(application),
+            "company_url": sanitize(company_url),
+            "company_name": sanitize(company["name"]),
+            "company_logo": sanitize(company["logo"]),
+            "company_industry": sanitize(company["industry"]),
+            "company_founded": sanitize(company["founded"]),
+            "company_type": sanitize(company["type"]),
+            "company_website": sanitize(company["website"]),
+            "company_address": sanitize(company["address"]),
+            "company_details": sanitize(company["details"]),
+            "job_url": sanitize(blk["url"]),
+            "estimated_deadline": sanitize(estimated_deadline),
+            "salary_range": sanitize(blk["salary"]),
+        })
+    return jobs
 
 
 def search_company_details_fallback(company_name: str) -> str:
@@ -505,44 +612,53 @@ def run():
         job_urls = scrape_job_list_page(page_num)
 
         for j, job_url in enumerate(job_urls, start=1):
-            job_id = make_job_id(job_url)
             logger.info(f"── Page {page_num} | Job {j}/{len(job_urls)}: {job_url}")
 
-            if job_id in processed_ids:
-                logger.info("⏭ SKIP — already processed.")
-                skipped += 1
-                continue
-
             try:
-                job = scrape_job_details(job_url)
+                subjobs = scrape_job_details(job_url)
             except Exception as e:
                 logger.error(f"Error scraping job {job_url}: {e}")
-                mark_processed(job_id, job_url, "", "scrape_failed")
-                processed_ids.add(job_id)
                 failed += 1
                 continue
 
-            if job is None or not job["job_title"] or not job["job_description"]:
-                logger.info("⏭ SKIP — missing title/description.")
-                mark_processed(job_id, job_url, "", "skipped_incomplete")
-                processed_ids.add(job_id)
+            if not subjobs:
+                logger.info("⏭ SKIP — no parsable job blocks on this page.")
                 skipped += 1
                 continue
 
-            if job["company_name"]:
-                save_company(job)
+            # One page can hold several positions (old /readjob/ layout) —
+            # post each one, skipping any already in the tracker.
+            for job in subjobs:
+                job_id = make_job_id(job["job_url"])
 
-            post_id, post_url = save_job(job)
-            if post_id:
-                mark_processed(job_id, job_url, job["job_title"], f"posted|wp_id={post_id}|{post_url or ''}")
-                posted += 1
-                logger.info(f"✅ SUCCESS — WP ID={post_id} 🔗 {post_url}")
-            else:
-                mark_processed(job_id, job_url, job["job_title"], "wp_post_failed")
-                failed += 1
-                logger.info("❌ WordPress post failed.")
+                if job_id in processed_ids:
+                    logger.info(f"⏭ SKIP — already processed: {job['job_title']}")
+                    skipped += 1
+                    continue
 
-            processed_ids.add(job_id)
+                if not job["job_title"] or not job["job_description"]:
+                    logger.info("⏭ SKIP — missing title/description.")
+                    mark_processed(job_id, job["job_url"], "", "skipped_incomplete")
+                    processed_ids.add(job_id)
+                    skipped += 1
+                    continue
+
+                if job["company_name"]:
+                    save_company(job)
+
+                post_id, post_url = save_job(job)
+                if post_id:
+                    mark_processed(job_id, job["job_url"], job["job_title"],
+                                    f"posted|wp_id={post_id}|{post_url or ''}")
+                    posted += 1
+                    logger.info(f"✅ SUCCESS — '{job['job_title']}' → WP ID={post_id} 🔗 {post_url}")
+                else:
+                    mark_processed(job_id, job["job_url"], job["job_title"], "wp_post_failed")
+                    failed += 1
+                    logger.info(f"❌ WordPress post failed: {job['job_title']}")
+
+                processed_ids.add(job_id)
+
             time.sleep(1)  # be polite to the source site
 
     logger.info(f"\n{'#'*60}")
