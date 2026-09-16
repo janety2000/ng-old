@@ -1,26 +1,4 @@
 #!/usr/bin/env python3
-"""
-myjobmag_scraper.py
-────────────────────────────────────────────────────────────────────────────
-Pure scraper — NO Mistral, NO sentence-transformers, NO language_tool.
-Scrapes myjobmag.com job listing pages 3 → 1 (descending), pulls full job +
-company details, and posts straight to WordPress (job-listings + companies
-custom post types) via the WP REST API.
-
-ENV VARS REQUIRED (set as GitHub Actions secrets or locally):
-    WP_BASE_URL      e.g. https://nigeria.mimusjobs.com/wp-json/wp/v2
-    WP_USERNAME
-    WP_APP_PASSWORD
-
-processed.csv is the dedup ledger — every job ID that has been scraped
-(posted, skipped, or failed) is written here. The GitHub Actions workflow
-commits this file back to the repo after every run, so the NEXT run reads
-it fresh and automatically skips everything already processed — it will
-never repost the same job twice, and effectively "resumes" from where the
-last run left off.
-────────────────────────────────────────────────────────────────────────────
-"""
-
 import os
 import re
 import csv
