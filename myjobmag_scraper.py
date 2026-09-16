@@ -15,9 +15,14 @@ from bs4 import BeautifulSoup
 # CONFIG
 # ════════════════════════════════════════════════════════════════════════════
 BASE_URL     = "https://www.myjobmag.com"
-START_PAGE   = 10800      # scrape starts here
-END_PAGE     = 50     # and goes down to (and including) here
-PAGE_RANGE   = range(START_PAGE, END_PAGE - 1, -1)   # 3, 2, 1
+START_PAGE   = 10800      # scrape starts here on a *fresh* run (no saved state)
+END_PAGE     = 50         # and goes down to (and including) here, eventually
+
+# How many list-pages to walk in a SINGLE invocation of this script.
+# 10,750 pages cannot be scraped in one 60-minute GitHub Actions run, so each
+# run only chews through a bounded chunk and saves where it stopped. The next
+# scheduled run picks up right after that — see load_current_page/save_current_page.
+PAGES_PER_RUN = int(os.environ.get("PAGES_PER_RUN", "15"))
 
 HEADERS = {
     "User-Agent": (
@@ -29,6 +34,7 @@ HEADERS = {
 }
 REQUEST_TIMEOUT = 20
 PROCESSED_IDS_FILE = "processed.csv"
+PAGE_STATE_FILE = "current_page.txt"
 
 # ── WordPress ─────────────────────────────────────────────────────────────────
 WP_URL      = os.environ.get("WP_BASE_URL", "")
@@ -132,6 +138,38 @@ def mark_processed(job_id: str, job_url: str, title: str, status: str):
     _init_tracker()
     with open(PROCESSED_IDS_FILE, "a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([job_id, job_url, title, status, datetime.now().isoformat()])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PAGE PROGRESS TRACKER
+# ════════════════════════════════════════════════════════════════════════════
+def load_current_page() -> int:
+    """
+    Returns the page number this run should START at. Reads whatever was
+    saved by the previous run; falls back to START_PAGE if this is the very
+    first run (or the state file is missing/corrupt).
+    """
+    if os.path.exists(PAGE_STATE_FILE):
+        try:
+            with open(PAGE_STATE_FILE, encoding="utf-8") as f:
+                saved = int(f.read().strip())
+            if saved < END_PAGE:
+                # Previous run already reached the bottom of the range.
+                # Wrap back around to the top so the scraper keeps picking
+                # up newly-posted jobs on future scheduled runs instead of
+                # sitting idle forever.
+                logger.info(f"📄 Saved page {saved} is below END_PAGE={END_PAGE} — "
+                            f"full range complete, wrapping back to START_PAGE={START_PAGE}.")
+                return START_PAGE
+            return saved
+        except (ValueError, OSError) as e:
+            logger.warning(f"Could not read {PAGE_STATE_FILE} ({e}) — using START_PAGE.")
+    return START_PAGE
+
+
+def save_current_page(next_page: int):
+    with open(PAGE_STATE_FILE, "w", encoding="utf-8") as f:
+        f.write(str(next_page))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -584,13 +622,32 @@ def run():
     processed_ids = load_processed_ids()
     logger.info(f"📋 {len(processed_ids)} jobs already in tracker.")
 
-    posted = skipped = failed = 0
+    start_page = load_current_page()
+    stop_page = max(start_page - PAGES_PER_RUN, END_PAGE - 1)
+    page_range = range(start_page, stop_page, -1)
+    logger.info(f"📄 This run: pages {start_page} → {stop_page + 1} "
+                f"({PAGES_PER_RUN} pages max), full range ends at {END_PAGE}.")
 
-    for page_num in PAGE_RANGE:
+    posted = skipped = failed = 0
+    last_page_done = start_page
+
+    for page_num in page_range:
+        last_page_done = page_num
         job_urls = scrape_job_list_page(page_num)
 
         for j, job_url in enumerate(job_urls, start=1):
             logger.info(f"── Page {page_num} | Job {j}/{len(job_urls)}: {job_url}")
+
+            # Cheap pre-check: on single-job pages the list URL IS the final
+            # job URL used for the tracker ID, so we can skip the network
+            # round-trip to fetch+parse the detail page entirely if it's
+            # already been processed. (Multi-job /readjob/ pages won't match
+            # here since their subjob URLs differ — they still get fetched
+            # and are de-duped individually further down, just not for free.)
+            if make_job_id(job_url) in processed_ids:
+                logger.info("⏭ SKIP (pre-check) — already processed, not re-fetching.")
+                skipped += 1
+                continue
 
             try:
                 subjobs = scrape_job_details(job_url)
@@ -639,8 +696,16 @@ def run():
 
             time.sleep(1)  # be polite to the source site
 
+        # Save progress after EVERY page, not just at the end — if this run
+        # itself gets killed (network hiccup, runner issue), the next run
+        # resumes from the last fully-completed page instead of from
+        # START_PAGE again.
+        save_current_page(page_num - 1)
+
     logger.info(f"\n{'#'*60}")
-    logger.info(f" CYCLE COMPLETE ({datetime.now().strftime('%Y-%m-%d %H:%M')})")
+    logger.info(f" RUN COMPLETE ({datetime.now().strftime('%Y-%m-%d %H:%M')})")
+    logger.info(f" 📄 Pages this run : {start_page} → {last_page_done}")
+    logger.info(f" ▶️  Resumes next at: {last_page_done - 1}")
     logger.info(f" ✅ Posted  : {posted}")
     logger.info(f" ⏭ Skipped : {skipped}")
     logger.info(f" ❌ Failed  : {failed}")
@@ -648,6 +713,6 @@ def run():
 
 
 if __name__ == "__main__":
-    logger.info("🚀 MyjobMag scraper — pages 3 → 1 — starting…")
+    logger.info("🚀 MyjobMag scraper — resumable chunked run — starting…")
     run()
     logger.info("✅ Done.")
